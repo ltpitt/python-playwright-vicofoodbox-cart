@@ -1,0 +1,12 @@
+# Copy to shopping_list.toml. Each item needs exactly one of `url` or `search`.
+
+[[items]]
+name = "Rummo Linguine"
+search = "rummo linguine"
+require = ["linguine", "500"]   # every term must appear in the product title (case-insensitive)
+quantity = 2
+
+[[items]]
+name = "Rummo Mezzi Rigatoni"
+url = "https://vicofoodbox.com/en/durum-wheat-pasta/191-rummo-mezzi-rigatoni-n51.html"
+quantity = 1

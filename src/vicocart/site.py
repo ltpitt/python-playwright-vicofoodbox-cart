@@ -1,0 +1,205 @@
+from __future__ import annotations
+
+import re
+from contextlib import suppress
+from dataclasses import dataclass
+from decimal import Decimal
+from urllib.parse import quote_plus
+
+from playwright.sync_api import Page, Response
+from playwright.sync_api import TimeoutError as PlaywrightTimeout
+
+from vicocart.config import Credentials
+from vicocart.shopping_list import Item
+
+BASE_URL = "https://vicofoodbox.com/en"
+TIMEOUT_MS = 15_000
+
+
+class SiteError(RuntimeError):
+    """The shop refused an action or did not look the way we expect."""
+
+
+@dataclass(frozen=True)
+class Product:
+    title: str
+    url: str
+    price: str
+
+
+@dataclass(frozen=True)
+class Listing:
+    """One search result. `price` is None when the shop shows none (usually unavailable)."""
+
+    id: int
+    title: str
+    url: str
+    price: Decimal | None
+    regular_price: Decimal | None
+
+    @property
+    def on_sale(self) -> bool:
+        return (
+            self.price is not None
+            and self.regular_price is not None
+            and self.regular_price > self.price
+        )
+
+
+@dataclass(frozen=True)
+class CartLine:
+    name: str
+    quantity: int
+
+
+@dataclass(frozen=True)
+class CartSnapshot:
+    lines: list[CartLine]
+    notices: list[str]
+
+
+class VicoSite:
+    """Drives vicofoodbox.com (PrestaShop). Stops at the cart; it never checks out."""
+
+    def __init__(self, page: Page) -> None:
+        self.page = page
+        page.set_default_timeout(TIMEOUT_MS)
+
+    def dismiss_cookies(self) -> None:
+        self.page.goto(BASE_URL, wait_until="domcontentloaded")
+        with suppress(PlaywrightTimeout):  # banner is absent once consent is stored
+            self.page.get_by_role("button", name="Reject All").first.click(timeout=5_000)
+
+    def login(self, credentials: Credentials) -> None:
+        page = self.page
+        page.goto(f"{BASE_URL}/my-account", wait_until="domcontentloaded")
+        page.click("#opc-login-link")
+        page.fill("#txt-login_email", credentials.email)
+        page.fill("#txt-login_password", credentials.password)
+        page.click("#btn-opc_login")
+        try:
+            page.locator("a[href*='mylogout']").first.wait_for(state="attached")
+        except PlaywrightTimeout as exc:
+            raise SiteError("login failed: check VICO_EMAIL and VICO_PASSWORD") from exc
+
+    def open_product(self, item: Item) -> Product:
+        """Navigate to the product page for an item and return what is on it."""
+        url = item.url or self._search(item)
+        self.page.goto(url, wait_until="domcontentloaded")
+        title = _squash(self.page.locator("h1").first.inner_text())
+        price_box = self.page.locator(".current-price-value").first
+        price = _squash(price_box.inner_text()) if price_box.count() else "?"
+        return Product(title=title, url=url, price=price)
+
+    def search(self, query: str, limit: int = 10) -> list[Listing]:
+        self.page.goto(
+            f"{BASE_URL}/search?controller=search&s={quote_plus(query)}",
+            wait_until="domcontentloaded",
+        )
+        cards = self.page.locator("article.product-miniature")
+        try:
+            cards.first.wait_for()
+        except PlaywrightTimeout:
+            return []
+        raw_cards = cards.evaluate_all(_READ_CARDS_JS)
+        listings = []
+        for raw in raw_cards[:limit]:
+            product_id = _product_id(raw["href"])
+            if product_id is not None:
+                listings.append(
+                    Listing(
+                        id=product_id,
+                        title=_squash(raw["title"]),
+                        url=raw["href"],
+                        price=_parse_price(raw["price"]),
+                        regular_price=_parse_price(raw["regular"]),
+                    )
+                )
+        return listings
+
+    def add_product(self, url: str, quantity: int) -> None:
+        self.page.goto(url, wait_until="domcontentloaded")
+        self.add_to_cart(quantity)
+
+    def add_to_cart(self, quantity: int) -> None:
+        """Add the product on the current page; raises SiteError with the shop's reason."""
+        page = self.page
+        button = page.locator("#add-to-cart-or-refresh button.add-to-cart")
+        if button.count() == 0 or button.is_disabled():
+            raise SiteError("cannot be added (out of stock, or not a product page)")
+        page.fill("#quantity_wanted", str(quantity))
+        with page.expect_response(_is_cart_update) as response_info:
+            button.click()
+        body = response_info.value.json()
+        if body.get("success") is not True:
+            raise SiteError(_format_errors(body.get("errors")))
+
+    def read_cart(self) -> CartSnapshot:
+        page = self.page
+        page.goto(f"{BASE_URL}/cart?action=show", wait_until="domcontentloaded")
+        lines = []
+        # The shop injects a free "Vico Gift" line; it is not something we added.
+        for row in page.locator("li.cart-item:not(.mdgift-item)").all():
+            name = _squash(row.locator("a.label").first.inner_text())
+            quantity = int(row.locator("input.js-cart-line-product-quantity").first.input_value())
+            lines.append(CartLine(name=name, quantity=quantity))
+        notices = [
+            _squash(box.inner_text())
+            for box in page.locator("#cgma_errors").all()
+            if box.is_visible()
+        ]
+        return CartSnapshot(lines=lines, notices=notices)
+
+    def _search(self, item: Item) -> str:
+        query = item.search or ""
+        listings = self.search(query, limit=30)
+        if not listings:
+            raise SiteError(f"no search results for {query!r}")
+        for listing in listings:
+            if item.matches(listing.title):
+                return listing.url
+        raise SiteError(f"no result for {query!r} contains all of {list(item.require)}")
+
+
+_READ_CARDS_JS = """cards => cards.map(card => {
+    const text = selector => {
+        const el = card.querySelector(selector);
+        return el ? el.innerText : '';
+    };
+    const link = card.querySelector('.product-title a');
+    return {
+        title: text('.product-title a'),
+        href: link ? link.href : '',
+        price: text('.product-price'),
+        regular: text('.regular-price'),
+    };
+})"""
+
+
+def _product_id(url: str) -> int | None:
+    match = re.search(r"/(\d+)-[^/]*\.html", url)
+    return int(match.group(1)) if match else None
+
+
+def _parse_price(text: str) -> Decimal | None:
+    match = re.search(r"\d+(?:\.\d+)?", text.replace(",", ""))
+    return Decimal(match.group()) if match else None
+
+
+def _is_cart_update(response: Response) -> bool:
+    request = response.request
+    return (
+        request.method == "POST"
+        and response.url.split("?")[0].rstrip("/").endswith("/cart")
+        and "action=update" in (request.post_data or "")
+    )
+
+
+def _format_errors(errors: object) -> str:
+    if isinstance(errors, list):
+        errors = "; ".join(str(error) for error in errors)
+    return str(errors) or "the shop rejected the request"
+
+
+def _squash(text: str) -> str:
+    return " ".join(text.split())
