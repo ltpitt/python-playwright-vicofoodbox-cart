@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from urllib.parse import quote_plus
 
-from playwright.sync_api import Page, Response
+from playwright.sync_api import Locator, Page, Response
 from playwright.sync_api import TimeoutError as PlaywrightTimeout
 
 from vicocart.config import Credentials
@@ -14,6 +14,8 @@ from vicocart.shopping_list import Item
 
 BASE_URL = "https://vicofoodbox.com/en"
 TIMEOUT_MS = 15_000
+# Checkout lives at /en/order. Aborting it makes "never orders" a guarantee, not a promise.
+CHECKOUT_URL = re.compile(r"/en/order(\?|#|$)")
 
 
 class SiteError(RuntimeError):
@@ -48,6 +50,7 @@ class Listing:
 
 @dataclass(frozen=True)
 class CartLine:
+    product_id: int
     name: str
     quantity: int
 
@@ -64,6 +67,7 @@ class VicoSite:
     def __init__(self, page: Page) -> None:
         self.page = page
         page.set_default_timeout(TIMEOUT_MS)
+        page.context.route(CHECKOUT_URL, lambda route: route.abort())
 
     def dismiss_cookies(self) -> None:
         self.page.goto(BASE_URL, wait_until="domcontentloaded")
@@ -74,13 +78,20 @@ class VicoSite:
         page = self.page
         page.goto(f"{BASE_URL}/my-account", wait_until="domcontentloaded")
         page.click("#opc-login-link")
-        page.fill("#txt-login_email", credentials.email)
-        page.fill("#txt-login_password", credentials.password)
-        page.click("#btn-opc_login")
+        # Clicking the link clones the form; the original stays hidden in the DOM.
+        page.fill("#txt-login_email:visible", credentials.email)
+        page.fill("#txt-login_password:visible", credentials.password)
+        page.click("#btn-opc_login:visible")
         try:
             page.locator("a[href*='mylogout']").first.wait_for(state="attached")
         except PlaywrightTimeout as exc:
-            raise SiteError("login failed: check VICO_EMAIL and VICO_PASSWORD") from exc
+            alert = page.locator(".alert-danger:visible").first
+            reason = (
+                _squash(alert.inner_text())
+                if alert.count()
+                else "check VICO_EMAIL and VICO_PASSWORD"
+            )
+            raise SiteError(f"login failed: {reason}") from exc
 
     def open_product(self, item: Item) -> Product:
         """Navigate to the product page for an item and return what is on it."""
@@ -130,9 +141,25 @@ class VicoSite:
         page.fill("#quantity_wanted", str(quantity))
         with page.expect_response(_is_cart_update) as response_info:
             button.click()
-        body = response_info.value.json()
-        if body.get("success") is not True:
-            raise SiteError(_format_errors(body.get("errors")))
+        _raise_unless_success(response_info.value)
+
+    def set_quantity(self, product_id: int, quantity: int) -> None:
+        """Set an existing cart line to `quantity` (>= 1) on the cart page."""
+        if quantity < 1:
+            raise ValueError("quantity must be >= 1; use remove_from_cart to drop a line")
+        field = self._cart_row(product_id).locator("input.js-cart-line-product-quantity").first
+        if field.input_value() == str(quantity):
+            return
+        field.fill(str(quantity))
+        with self.page.expect_response(_is_cart_line_update) as response_info:
+            field.press("Tab")  # the shop updates the cart on the input's change event
+        _raise_unless_success(response_info.value)
+
+    def remove_from_cart(self, product_id: int) -> None:
+        row = self._cart_row(product_id)
+        with self.page.expect_response(_is_cart_line_delete) as response_info:
+            row.locator("a.remove-from-cart").first.click()
+        _raise_unless_success(response_info.value)
 
     def read_cart(self) -> CartSnapshot:
         page = self.page
@@ -140,15 +167,28 @@ class VicoSite:
         lines = []
         # The shop injects a free "Vico Gift" line; it is not something we added.
         for row in page.locator("li.cart-item:not(.mdgift-item)").all():
+            product_id = int(
+                row.locator("a.remove-from-cart").first.get_attribute("data-id-product") or 0
+            )
             name = _squash(row.locator("a.label").first.inner_text())
             quantity = int(row.locator("input.js-cart-line-product-quantity").first.input_value())
-            lines.append(CartLine(name=name, quantity=quantity))
+            lines.append(CartLine(product_id=product_id, name=name, quantity=quantity))
         notices = [
             _squash(box.inner_text())
             for box in page.locator("#cgma_errors").all()
             if box.is_visible()
         ]
         return CartSnapshot(lines=lines, notices=notices)
+
+    def _cart_row(self, product_id: int) -> Locator:
+        self.page.goto(f"{BASE_URL}/cart?action=show", wait_until="domcontentloaded")
+        row = self.page.locator(
+            "li.cart-item:not(.mdgift-item)"
+            f":has(a.remove-from-cart[data-id-product='{product_id}'])"
+        )
+        if row.count() == 0:
+            raise SiteError(f"product {product_id} is not in the cart")
+        return row.first
 
     def _search(self, item: Item) -> str:
         query = item.search or ""
@@ -184,6 +224,20 @@ def _product_id(url: str) -> int | None:
 def _parse_price(text: str) -> Decimal | None:
     match = re.search(r"\d+(?:\.\d+)?", text.replace(",", ""))
     return Decimal(match.group()) if match else None
+
+
+def _is_cart_line_update(response: Response) -> bool:
+    return response.request.method == "POST" and "update=1" in response.url
+
+
+def _is_cart_line_delete(response: Response) -> bool:
+    return response.request.method == "POST" and "delete=1" in response.url
+
+
+def _raise_unless_success(response: Response) -> None:
+    body = response.json()
+    if body.get("success") is not True:
+        raise SiteError(_format_errors(body.get("errors")))
 
 
 def _is_cart_update(response: Response) -> bool:

@@ -97,7 +97,7 @@ def test_search_results_expose_offer_information() -> None:
 
 
 def test_goal_and_existing_cart_reach_the_model() -> None:
-    shop = FakeShop([], cart=[CartLine("Spaghetti", 2)])
+    shop = FakeShop([], cart=[CartLine(7, "Spaghetti", 2)])
     llm = ScriptedLlm([done()])
     run_agent(llm, shop, "make carbonara")
     prompt = llm.requests[0][1]["content"]

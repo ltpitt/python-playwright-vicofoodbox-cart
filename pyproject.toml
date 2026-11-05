@@ -40,3 +40,5 @@ mypy_path = "src"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-m 'not live'"
+markers = ["live: drives the real shop with Playwright; run with `pytest -m live`"]

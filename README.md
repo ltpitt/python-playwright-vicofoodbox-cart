@@ -31,6 +31,14 @@ The agent has three tools: search, add to cart, view cart. Limits are enforced i
 
 Exit code is 0 on success, 1 when an item failed or the agent did not finish, 2 for bad config.
 
+## Live proof
+
+```sh
+.venv/bin/pytest -m live -v
+```
+
+Drives the real shop headless: add a product, change its quantity, remove it. Checkout is blocked at the network level, so nothing can be ordered. The guest test needs nothing; the account test logs in with `VICO_EMAIL`/`VICO_PASSWORD` and leaves the account cart as it found it. Plain `pytest` skips these.
+
 ## Checks
 
 ```sh
