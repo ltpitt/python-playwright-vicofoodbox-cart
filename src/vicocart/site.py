@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from decimal import Decimal
+from typing import Any
 from urllib.parse import quote_plus
 
 from playwright.sync_api import Locator, Page, Response
@@ -13,6 +15,7 @@ from vicocart.config import Credentials
 from vicocart.shopping_list import Item
 
 BASE_URL = "https://vicofoodbox.com/en"
+WISHLIST_URL = f"{BASE_URL}/wishlist"
 TIMEOUT_MS = 15_000
 # Checkout lives at /en/order. Aborting it makes "never orders" a guarantee, not a promise.
 CHECKOUT_URL = re.compile(r"/en/order(\?|#|$)")
@@ -59,6 +62,14 @@ class CartLine:
 class CartSnapshot:
     lines: list[CartLine]
     notices: list[str]
+
+
+@dataclass(frozen=True)
+class WishlistLine:
+    product_id: int
+    name: str
+    url: str
+    price: str
 
 
 class VicoSite:
@@ -180,6 +191,43 @@ class VicoSite:
         ]
         return CartSnapshot(lines=lines, notices=notices)
 
+    def add_to_wishlist(self) -> None:
+        """Save the product on the current page to the account wishlist (saving twice is fine)."""
+        page = self.page
+        button = page.locator(".btn-iqitwishlist-add").first
+        if button.count() == 0:
+            raise SiteError("cannot be saved (not a product page)")
+        with page.expect_response(_is_wishlist_action) as response_info:
+            button.click()
+        _check_wishlist_add(response_info.value.json())
+
+    def read_wishlist(self) -> list[WishlistLine]:
+        self.page.goto(WISHLIST_URL, wait_until="networkidle")
+        lines = []
+        for row in self.page.locator(".iqitwishlist-product").all():
+            link = row.locator("._name a").first
+            url = link.get_attribute("href") or ""
+            product_id = _product_id(url)
+            if product_id is None:
+                continue
+            price_box = row.locator(".product-price")
+            price = _squash(price_box.first.inner_text()) if price_box.count() else "?"
+            lines.append(
+                WishlistLine(
+                    product_id=product_id, name=_squash(link.inner_text()), url=url, price=price
+                )
+            )
+        return lines
+
+    def remove_from_wishlist(self, product_id: int) -> None:
+        self.page.goto(WISHLIST_URL, wait_until="networkidle")
+        row = self.page.locator(f".iqitwishlist-product:has(a[href*='/{product_id}-'])")
+        if row.count() == 0:
+            raise SiteError(f"product {product_id} is not on the wishlist")
+        with self.page.expect_response(_is_wishlist_action) as response_info:
+            row.first.locator(".js-iqitwishlist-remove").click()
+        _check_wishlist_remove(response_info.value.json())
+
     def _cart_row(self, product_id: int) -> Locator:
         self.page.goto(f"{BASE_URL}/cart?action=show", wait_until="domcontentloaded")
         row = self.page.locator(
@@ -238,6 +286,27 @@ def _raise_unless_success(response: Response) -> None:
     body = response.json()
     if body.get("success") is not True:
         raise SiteError(_format_errors(body.get("errors")))
+
+
+def _is_wishlist_action(response: Response) -> bool:
+    return response.request.method == "POST" and "/module/iqitwishlist/actions" in response.url
+
+
+def _check_wishlist_add(body: Mapping[str, Any]) -> None:
+    if body.get("success") is True:
+        return
+    data = body.get("data") or {}
+    kind = data.get("type")
+    if kind == "inWishlit":  # the shop's own spelling; its message is wrong, the product is saved
+        return
+    if kind == "notLogged":
+        raise SiteError("the wishlist needs a logged-in account (VICO_EMAIL and VICO_PASSWORD)")
+    raise SiteError(str(data.get("message") or "the shop rejected the request"))
+
+
+def _check_wishlist_remove(body: Mapping[str, Any]) -> None:
+    if body.get("success") is not True:
+        raise SiteError(str((body.get("data") or {}).get("message") or "the shop rejected it"))
 
 
 def _is_cart_update(response: Response) -> bool:

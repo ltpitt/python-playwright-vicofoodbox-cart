@@ -15,20 +15,30 @@ from playwright.sync_api import sync_playwright
 from vicocart.agent import Limits, run_agent
 from vicocart.config import ConfigError, Credentials, load_credentials, load_llm_settings
 from vicocart.llm import OpenAiChat
-from vicocart.runner import Outcome, fill_cart
+from vicocart.runner import Outcome, Target, add_items
 from vicocart.shopping_list import Item, ShoppingListError, load_shopping_list
-from vicocart.site import CartSnapshot, SiteError, VicoSite
+from vicocart.site import WISHLIST_URL, CartSnapshot, SiteError, VicoSite, WishlistLine
 
 Job = Callable[[VicoSite], int]
 
 _MAIN_EPILOG = """\
 Run from the repo directory: .env (VICO_EMAIL, VICO_PASSWORD) is read from the working
 directory or a parent.
-`list` needs no LLM and is the one to script; run it with --dry-run first.
+
+`list` is the one to script and needs no LLM. It saves products to the account wishlist,
+which any browser can open after logging in. A cart only lives inside the browser session
+that filled it, so a headless run cannot leave one behind: `ask` and `list --cart` need
+--headed for that reason. Always try --dry-run first.
+
 Exit code: 0 ok, 1 an item failed or the agent did not finish, 2 bad config.
 """
 
-_LIST_EPILOG = """\
+_LIST_EPILOG = f"""\
+Saves each product to the account wishlist (login required). The wishlist keeps no quantities:
+each "[ok]" line shows the quantity wanted and the product link. Afterwards tell the user to
+open {WISHLIST_URL}, set quantities and click "Add to Box".
+--cart fills the cart instead (needs --headed).
+
 shopping_list.toml: one [[items]] table per product, exactly one of url/search.
   [[items]]
   search = "rummo linguine"      # or: url = "https://vicofoodbox.com/en/....html"
@@ -48,12 +58,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    if credentials is None and not (args.dry_run or args.headed):
-        print(
-            "error: set VICO_EMAIL and VICO_PASSWORD in .env so the cart is saved to your account, "
-            "or use --headed to keep a guest cart open in the browser",
-            file=sys.stderr,
-        )
+    problem = _setup_problem(args, credentials)
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
         return 2
 
     try:
@@ -68,10 +75,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 1
 
 
+def _setup_problem(args: argparse.Namespace, credentials: Credentials | None) -> str | None:
+    if args.dry_run:
+        return None
+    if args.command == "ask" or args.cart:
+        if args.headed:
+            return None
+        return (
+            "a cart only lives inside the browser session that filled it, so a headless run "
+            "leaves nothing to see: add --headed to keep the browser open on the cart, "
+            "or use `list` without --cart to save to the wishlist"
+        )
+    if credentials is None:
+        return "the wishlist needs your account: set VICO_EMAIL and VICO_PASSWORD in .env"
+    return None
+
+
 def _build_job(args: argparse.Namespace) -> Job:
     if args.command == "list":
         items = load_shopping_list(args.shopping_list)
-        return lambda site: _run_list(site, items, dry_run=args.dry_run)
+        target: Target = "cart" if args.cart else "wishlist"
+        return lambda site: _run_list(site, items, target=target, dry_run=args.dry_run)
     llm = OpenAiChat(load_llm_settings(os.environ))
     limits = Limits(max_steps=args.max_steps, budget=Decimal(str(args.budget)))
     return lambda site: _run_ask(site, llm, args.goal, limits, dry_run=args.dry_run)
@@ -89,16 +113,19 @@ def _open_site(*, headed: bool, credentials: Credentials | None) -> Iterator[Vic
                 site.login(credentials)
             yield site
             if headed and sys.stdin.isatty():
-                input("Browser left open on the cart page. Press Enter to close it. ")
+                input("Browser left open on the last page. Press Enter to close it. ")
         finally:
             browser.close()
 
 
-def _run_list(site: VicoSite, items: list[Item], *, dry_run: bool) -> int:
-    outcomes = fill_cart(site, items, dry_run=dry_run)
-    _print_outcomes(outcomes, dry_run=dry_run)
+def _run_list(site: VicoSite, items: list[Item], *, target: Target, dry_run: bool) -> int:
+    outcomes = add_items(site, items, target=target, dry_run=dry_run)
+    _print_outcomes(outcomes, target=target, dry_run=dry_run)
     if not dry_run:
-        _print_cart(site.read_cart())
+        if target == "wishlist":
+            _print_wishlist(site.read_wishlist())
+        else:
+            _print_cart(site.read_cart())
     return 0 if all(outcome.ok for outcome in outcomes) else 1
 
 
@@ -121,20 +148,20 @@ def _run_ask(site: VicoSite, llm: OpenAiChat, goal: str, limits: Limits, *, dry_
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="vicocart",
-        description="Fill the vicofoodbox.com cart. It never checks out.",
+        description="Save vicofoodbox.com products to your wishlist or cart. It never checks out.",
         epilog=_MAIN_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument(
-        "--dry-run", action="store_true", help="do everything except touch the cart"
+        "--dry-run", action="store_true", help="do everything except touch the wishlist or cart"
     )
     common.add_argument("--headed", action="store_true", help="show the browser and keep it open")
 
     commands = parser.add_subparsers(dest="command", required=True)
 
     ask = commands.add_parser(
-        "ask", parents=[common], help="describe a goal; an LLM fills the cart"
+        "ask", parents=[common], help="describe a goal; an LLM fills the cart (needs --headed)"
     )
     ask.add_argument("goal", help='e.g. "I want to make carbonara for 4"')
     ask.add_argument("--budget", type=float, default=150, help="max EUR to add (default: 150)")
@@ -143,9 +170,12 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     shopping_list = commands.add_parser(
         "list",
         parents=[common],
-        help="add the items of a TOML shopping list",
+        help="save the products of a TOML shopping list to your wishlist",
         epilog=_LIST_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    shopping_list.add_argument(
+        "--cart", action="store_true", help="fill the cart instead of the wishlist (needs --headed)"
     )
     shopping_list.add_argument(
         "shopping_list",
@@ -157,15 +187,30 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _print_outcomes(outcomes: list[Outcome], *, dry_run: bool) -> None:
-    verb = "found" if dry_run else "added"
+def _print_outcomes(outcomes: list[Outcome], *, target: Target, dry_run: bool) -> None:
     for outcome in outcomes:
         product = outcome.product
         label = f"{product.title} ({product.price})" if product else outcome.item.name
-        if outcome.ok:
-            print(f"[ok]   {verb} {outcome.item.quantity} x {label}")
+        quantity = outcome.item.quantity
+        if not outcome.ok:
+            print(f"[FAIL] {quantity} x {label}: {outcome.error}")
+        elif target == "wishlist":
+            verb = "found" if dry_run else "wishlisted"
+            link = f": {product.url}" if product else ""
+            print(f"[ok]   {verb} {label}, want {quantity}{link}")
         else:
-            print(f"[FAIL] {outcome.item.quantity} x {label}: {outcome.error}")
+            verb = "found" if dry_run else "added"
+            print(f"[ok]   {verb} {quantity} x {label}")
+
+
+def _print_wishlist(lines: list[WishlistLine]) -> None:
+    print("\nWishlist now contains:")
+    for line in lines:
+        print(f"  {line.name} ({line.price})")
+    print(
+        f"\nNext: log in and open {WISHLIST_URL}, set the quantities and click Add to Box. "
+        "The wishlist keeps no quantities, so use the 'want' numbers above."
+    )
 
 
 def _print_cart(snapshot: CartSnapshot) -> None:

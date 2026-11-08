@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "vicocart"
 version = "0.1.0"
-description = "Fill the vicofoodbox.com shopping cart from a TOML shopping list."
+description = "Save vicofoodbox.com products to your account wishlist (or fill a cart) from a TOML shopping list."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
