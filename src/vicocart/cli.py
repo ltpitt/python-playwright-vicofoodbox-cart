@@ -21,6 +21,22 @@ from vicocart.site import CartSnapshot, SiteError, VicoSite
 
 Job = Callable[[VicoSite], int]
 
+_MAIN_EPILOG = """\
+Run from the repo directory: .env (VICO_EMAIL, VICO_PASSWORD) is read from the working
+directory or a parent.
+`list` needs no LLM and is the one to script; run it with --dry-run first.
+Exit code: 0 ok, 1 an item failed or the agent did not finish, 2 bad config.
+"""
+
+_LIST_EPILOG = """\
+shopping_list.toml: one [[items]] table per product, exactly one of url/search.
+  [[items]]
+  search = "rummo linguine"      # or: url = "https://vicofoodbox.com/en/....html"
+  require = ["linguine", "500"]  # optional: every term must be in the product title
+  quantity = 2                   # optional, default 1
+  name = "Rummo Linguine"        # optional label for the output
+"""
+
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
@@ -104,7 +120,10 @@ def _run_ask(site: VicoSite, llm: OpenAiChat, goal: str, limits: Limits, *, dry_
 
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        prog="vicocart", description="Fill the vicofoodbox.com cart. It never checks out."
+        prog="vicocart",
+        description="Fill the vicofoodbox.com cart. It never checks out.",
+        epilog=_MAIN_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument(
@@ -122,7 +141,11 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     ask.add_argument("--max-steps", type=int, default=15, help="max LLM turns (default: 15)")
 
     shopping_list = commands.add_parser(
-        "list", parents=[common], help="add the items of a TOML shopping list"
+        "list",
+        parents=[common],
+        help="add the items of a TOML shopping list",
+        epilog=_LIST_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     shopping_list.add_argument(
         "shopping_list",
